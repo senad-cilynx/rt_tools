@@ -18,7 +18,7 @@ import socket
 import sys
 import os
 import re
-import subprocess
+import struct
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +30,13 @@ try:
 except ImportError:
     HAS_IMPACKET = False
     print("[!] impacket not installed, SMB enumeration disabled")
+
+try:
+    import dns.resolver
+    HAS_DNS = True
+except ImportError:
+    HAS_DNS = False
+    print("[!] dnspython not installed, using socket fallback for DNS")
 
 PORTS = {21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",80:"HTTP",88:"Kerberos",110:"POP3",111:"RPCBind",135:"RPC/MSRPC",139:"NetBIOS-SSN",143:"IMAP",389:"LDAP",443:"HTTPS",445:"SMB",464:"Kerberos-Pwd",587:"SMTP-Sub",593:"HTTP-RPC",636:"LDAPS",993:"IMAPS",995:"POP3S",1433:"MSSQL",1521:"Oracle",2049:"NFS",3050:"Firebird",3268:"GC-LDAP",3269:"GC-LDAPS",3306:"MySQL",3389:"RDP",5432:"PostgreSQL",5985:"WinRM-HTTP",5986:"WinRM-HTTPS",8080:"HTTP-Proxy",8443:"HTTPS-Alt",8888:"HTTP-Alt",9389:"AD-Web-Svc",27017:"MongoDB"}
 QUICK_PORTS = {88:"Kerberos",135:"RPC",389:"LDAP",445:"SMB",1433:"MSSQL",3050:"Firebird",3306:"MySQL",3389:"RDP",5985:"WinRM",5432:"PostgreSQL",8080:"HTTP-Proxy",443:"HTTPS",80:"HTTP"}
@@ -102,14 +109,14 @@ class Scanner:
         for srv, desc in DNS_SRV_RECORDS:
             fqdn=f"{srv}.{domain}"
             try:
-                r=subprocess.run(['nslookup','-type=SRV',fqdn], capture_output=True, text=True, timeout=10)
                 entries=[]
-                for line in r.stdout.split('\n'):
-                    line=line.strip()
-                    if 'svr hostname' in line.lower():
-                        entries.append(line.split('=')[-1].strip().rstrip('.'))
-                    elif 'service location' in line.lower():
-                        parts=line.split(); entries.append(parts[-1].rstrip('.')) if parts else None
+                if HAS_DNS:
+                    answers=dns.resolver.resolve(fqdn, 'SRV')
+                    for r in answers:
+                        entries.append(str(r.target).rstrip('.'))
+                else:
+                    # Pure socket fallback using DNS wire protocol
+                    entries=self._dns_srv_query(fqdn)
                 if entries:
                     self.dns_results[desc]=entries
                     self.log(f"  {desc}:")
@@ -120,13 +127,98 @@ class Scanner:
                 elif self.verbose: self.log(f"  {desc}: No records")
             except: pass
 
-    def _resolve(self, hostname):
+    def _dns_srv_query(self, fqdn):
+        """Pure socket DNS SRV query - no external process needed"""
+        entries=[]
         try:
-            r=subprocess.run(['nslookup',hostname], capture_output=True, text=True, timeout=5)
-            for l in r.stdout.split('\n'):
-                if 'address' in l.lower():
-                    ip=l.split(':')[-1].strip()
-                    if ip and not ip.startswith(('10.46.181.14','10.71.181.14')): return ip
+            # Build DNS query packet
+            txid=os.urandom(2)
+            flags=b'\x01\x00' # standard query, recursion desired
+            qdcount=b'\x00\x01'; ancount=b'\x00\x00'; nscount=b'\x00\x00'; arcount=b'\x00\x00'
+            # Encode QNAME
+            qname=b''
+            for part in fqdn.split('.'):
+                qname+=bytes([len(part)])+part.encode()
+            qname+=b'\x00'
+            qtype=b'\x00\x21' # SRV
+            qclass=b'\x00\x01' # IN
+            packet=txid+flags+qdcount+ancount+nscount+arcount+qname+qtype+qclass
+            # Get DNS server from system
+            dns_server=None
+            try:
+                import winreg
+                key=winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces')
+                for i in range(256):
+                    try:
+                        subkey_name=winreg.EnumKey(key,i)
+                        subkey=winreg.OpenKey(key,subkey_name)
+                        try:
+                            ns,_=winreg.QueryValueEx(subkey,'DhcpNameServer')
+                            if ns: dns_server=ns.split()[0]; break
+                        except: pass
+                        try:
+                            ns,_=winreg.QueryValueEx(subkey,'NameServer')
+                            if ns: dns_server=ns.split(',')[0]; break
+                        except: pass
+                    except: break
+            except:
+                dns_server='10.46.181.14' # fallback to known DC
+            if not dns_server: dns_server='10.46.181.14'
+            # Send UDP query
+            s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(5)
+            s.sendto(packet,(dns_server,53))
+            resp,_=s.recvfrom(4096)
+            s.close()
+            # Parse response - skip header (12 bytes) and question section
+            pos=12
+            while resp[pos]!=0: pos+=resp[pos]+1
+            pos+=5 # null byte + qtype + qclass
+            # Parse answers
+            ancount_val=struct.unpack('!H',resp[4:6])[0]
+            for _ in range(ancount_val):
+                # Skip name (could be pointer)
+                if resp[pos]&0xC0==0xC0: pos+=2
+                else:
+                    while resp[pos]!=0: pos+=resp[pos]+1
+                    pos+=1
+                rtype=struct.unpack('!H',resp[pos:pos+2])[0]; pos+=2
+                pos+=2 # class
+                pos+=4 # ttl
+                rdlen=struct.unpack('!H',resp[pos:pos+2])[0]; pos+=2
+                if rtype==33: # SRV
+                    pos+=6 # priority, weight, port
+                    # Read target name
+                    name=''
+                    tpos=pos
+                    while resp[tpos]!=0:
+                        if resp[tpos]&0xC0==0xC0:
+                            ptr=struct.unpack('!H',resp[tpos:tpos+2])[0]&0x3FFF
+                            while resp[ptr]!=0:
+                                l=resp[ptr]; ptr+=1
+                                name+=resp[ptr:ptr+l].decode()+'.'; ptr+=l
+                            break
+                        else:
+                            l=resp[tpos]; tpos+=1
+                            name+=resp[tpos:tpos+l].decode()+'.'; tpos+=l
+                    entries.append(name.rstrip('.'))
+                    pos+=rdlen-6
+                else:
+                    pos+=rdlen
+        except: pass
+        return entries
+
+    def _resolve(self, hostname):
+        """Resolve hostname to IP using pure Python"""
+        try:
+            if HAS_DNS:
+                answers=dns.resolver.resolve(hostname, 'A')
+                for r in answers:
+                    ip=str(r)
+                    if not ip.startswith(('10.46.181.14','10.71.181.14')): return ip
+            else:
+                ip=socket.gethostbyname(hostname)
+                if not ip.startswith(('10.46.181.14','10.71.181.14')): return ip
         except: pass
         return None
 
@@ -146,11 +238,16 @@ class Scanner:
         except: return None
 
     def _resolve_hostname(self, ip):
+        """Reverse DNS lookup using pure Python"""
         try:
-            r=subprocess.run(['nslookup',ip], capture_output=True, text=True, timeout=5)
-            for l in r.stdout.split('\n'):
-                if 'name' in l.lower() and ('=' in l or ':' in l):
-                    return l.split('=' if '=' in l else ':')[-1].strip().rstrip('.')
+            if HAS_DNS:
+                rev=dns.reversename.from_address(ip)
+                answers=dns.resolver.resolve(rev, 'PTR')
+                for r in answers:
+                    return str(r).rstrip('.')
+            else:
+                hostname,_,_=socket.gethostbyaddr(ip)
+                return hostname
         except: pass
         return None
 
