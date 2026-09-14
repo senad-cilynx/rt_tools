@@ -82,7 +82,7 @@ def main():
                     'name': name,
                     'enabled': props.get('enabled', False),
                     'hasspn': props.get('hasspn', False),
-                    'description': props.get('description', ''),
+                    'description': props.get('description') or '',
                     'pwdlastset': props.get('pwdlastset', 0),
                     'lastlogon': props.get('lastlogon', 0),
                     'sensitive': props.get('sensitive', False),
@@ -136,7 +136,7 @@ def main():
     print(f"\n  Enabled admins with SPNs (Kerberoastable):")
     for u in admin_users:
         if u['hasspn'] and u.get('enabled', True):
-            print(f"    {u['name']} | Desc: {u['description'][:60]}")
+            print(f"    {u['name']} | Desc: {(u['description'] or 'N/A')[:60]}")
     
     print(f"\n  Admin accounts with SID History:")
     for u in admin_users:
