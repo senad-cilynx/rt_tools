@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Find Windows Servers and test admin access - parallel, fast"""
-import asyncio, sys, os, subprocess, socket
+import asyncio, sys, os, socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 async def find_servers(url, modern_only=True):
@@ -55,44 +55,25 @@ def is_alive(host, port=445, timeout=2):
         return False
 
 def test_admin(host, user, pwd, domain):
-    # First check if port 445 is open
+    from impacket.smbconnection import SMBConnection
     if not is_alive(host):
         return 'OFFLINE'
     try:
-        subprocess.run(['net', 'use', f'\\\\{host}\\IPC$', '/delete', '/y'],
-            capture_output=True, timeout=3)
-    except:
-        pass
-    try:
-        r = subprocess.run(
-            ['net', 'use', f'\\\\{host}\\IPC$', f'/user:{domain}\\{user}', pwd],
-            capture_output=True, text=True, timeout=5
-        )
-        if 'successfully' not in r.stdout.lower():
-            return 'DENIED'
-        # Try ADMIN$
-        subprocess.run(['net', 'use', f'\\\\{host}\\IPC$', '/delete', '/y'],
-            capture_output=True, timeout=3)
-        r2 = subprocess.run(
-            ['net', 'use', f'\\\\{host}\\ADMIN$', f'/user:{domain}\\{user}', pwd],
-            capture_output=True, text=True, timeout=5
-        )
-        if 'successfully' in r2.stdout.lower():
-            subprocess.run(['net', 'use', f'\\\\{host}\\ADMIN$', '/delete', '/y'],
-                capture_output=True, timeout=3)
+        c = SMBConnection(host, host, timeout=5)
+        c.login(user, pwd, domain)
+        shares = [s['shi1_netname'].rstrip('\x00') for s in c.listShares()]
+        c.logoff()
+        if 'ADMIN$' in shares:
             return 'ADMIN$'
-        # Try C$
-        r3 = subprocess.run(
-            ['net', 'use', f'\\\\{host}\\C$', f'/user:{domain}\\{user}', pwd],
-            capture_output=True, text=True, timeout=5
-        )
-        if 'successfully' in r3.stdout.lower():
-            subprocess.run(['net', 'use', f'\\\\{host}\\C$', '/delete', '/y'],
-                capture_output=True, timeout=3)
+        elif 'C$' in shares:
             return 'C$'
-        return 'IPC_ONLY'
-    except:
-        return 'TIMEOUT'
+        else:
+            return 'IPC_ONLY'
+    except Exception as e:
+        err = str(e).lower()
+        if 'access' in err or 'denied' in err or 'logon' in err:
+            return 'DENIED'
+        return 'ERROR'
 
 def test_worker(args):
     host, os_name, user, pwd, domain = args
